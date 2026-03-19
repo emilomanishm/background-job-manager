@@ -14,6 +14,16 @@ Whether you need to send bulk notifications, process large files, or sync databa
 4. **Processing:** The system routes the webhook to the correct **Handler** based on the job's "Subject" (e.g., `user:sync`).
 5. **Completion/Retry:** If successful, the job is marked `COMPLETED`. If it fails, it is automatically retried based on configured limits, or sent to a **Failure Handler**.
 
+```mermaid
+graph TD
+    A[1. Creation: Save to MongoDB] --> B[2. Dispatching: Schedule via AWS EventBridge]
+    B --> C[3. Triggering: AWS EventBridge fires Webhook to API]
+    C --> D[4. Processing: Route payload to Handler by Subject]
+    D --> E{5. Success?}
+    E -- Yes --> F[Mark job as COMPLETED]
+    E -- No --> G[Automatic Retry or route to Failure Handler]
+```
+
 ---
 
 ##  Features
@@ -30,16 +40,19 @@ Whether you need to send bulk notifications, process large files, or sync databa
 
 ```text
 src/
+├── controllers/
+│   └── background-jobs.controller.js # API controllers for job management
 ├── lib/
 │   └── background-job-worker/  # Core engine (Job Manager, Dispatchers, Retries)
 ├── models/
-│   └── clt-background-jobs.js  # MongoDB schema for tracking job states
+│   └── clt_background_jobs.js  # MongoDB schema for tracking job states
 ├── routes/
+│   ├── background-jobs.route.js # Management API endpoints
 │   └── lambda.routes.js        # Webhook endpoints triggered by AWS
 └── services/
     └── background-jobs/
         ├── handlers/           # 🟢 Business logic for successful jobs
-        ├── failure-handlers/   # 🔴 Fallback logic when jobs 
+        ├── failure-handlers/   # 🔴 Fallback logic when jobs fail
         ├── index.js            # Manager initialization & security setup
         └── subjects.js         # Dictionary of all allowed Job Topics
 ```
