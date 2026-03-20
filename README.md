@@ -11,7 +11,7 @@ Your app  →  trigger()  →  MongoDB (queued)  →  AWS Scheduler
                                                       ↓
                                          POST /api/lambda/jobs
                                                       ↓
-                                    verifyHttp() → _process() → your handler()
+                                    verifyHttp() → #process() → your handler()
                                                       ↓
                                            success → completed
                                            failure → reschedule (same document)
@@ -26,7 +26,7 @@ Your app  →  trigger()  →  MongoDB (queued)  →  AWS Scheduler
 ```bash
 git clone https://github.com/emilomanishm/background-job-manager
 cd background-job-worker
-cp  .env   
+cp .env.example .env    # fill in your values
 npm install
 npm run dev
 ```
@@ -111,7 +111,7 @@ MAIL_FROM=onboarding@resend.dev
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/xxx/yyy/zzz
 ```
 
-> **On Lambda:** Do not set `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. The Lambda execution role provides credentials automatically. Only set these locally.
+> **On Lambda:** Do not set `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`.
 
 ---
 
@@ -350,7 +350,7 @@ Collection: `clt_background_jobs`
 | `meta` | Mixed | `opts.meta` from `trigger()` |
 | `priority` | String | `low` / `normal` / `high` |
 | `logs` | Array | `{ attempt, status, log, timestamp }[]` — full run history |
-| `startedAt` | Date | When `_process()` last started |
+| `startedAt` | Date | When `#process()` last started |
 | `completedAt` | Date | Set on success |
 | `failedAt` | Date | Set on each failure |
 | `createdAt` | Date | When `trigger()` was called |
@@ -365,6 +365,12 @@ Lambda signs the raw request body with HMAC-SHA256 using `LAMBDA_WEBHOOK_SECRET`
 **Critical:** `app.js` captures the raw body before `express.json()` parses it:
 
 ```js
+// app.js — this middleware MUST come before express.json()
+app.use((req, _res, next) => {
+  let raw = ''
+  req.on('data', (chunk) => { raw += chunk })
+  req.on('end', () => { req.rawBody = raw; next() })
+})
 app.use(express.json())
 ```
 
@@ -458,7 +464,7 @@ export async function handler(event) {
 
   const res = await fetch(`${process.env.SERVER_URL}/api/lambda/jobs`, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/json', 'x-job-signature': sig },
+    headers: { 'Content-Type': 'application/json', 'x-job-signature': secret },
     body,
   })
 
@@ -481,7 +487,7 @@ export async function handler(event) {
 | Change signature verification | `verifyHttp` function in `services/background-jobs/index.js` |
 | Add a DB field | `models/clt_background_jobs.js` |
 
-> For a complete explanation of how `background-job-manager.js` works internally,
+> For a complete explanation of how `background-job-manager.js` works internally
 
 ---
 
