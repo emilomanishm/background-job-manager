@@ -1,4 +1,3 @@
-
 import BackgroundJobManager from '../../lib/background-job-worker/background-job-manager.js'
 //import EventBridgeDispatcher from '../../lib/background-job-worker/event-bridge-dispatcher.js'
 import SchedulerDispatcher from '../../lib/background-job-worker/scheduler-dispatcher.js'
@@ -24,10 +23,10 @@ const manager = new BackgroundJobManager({
   platform: 'emilo',
   model: BackgroundJob,
   options: {
-    secret: process.env.LAMBDA_WEBHOOK_SECRET, // e.g. 'secret'
+    secret: process.env.LAMBDA_WEBHOOK_SECRET,
     verifyHttp: async (req) => {
       const token = req.headers['x-event-secret']
-      if (!token || !process.env.LAMBDA_WEBHOOK_SECRET) return false // Prevent undefined === undefined bug
+      if (!token || !process.env.LAMBDA_WEBHOOK_SECRET) return false 
       return token === process.env.LAMBDA_WEBHOOK_SECRET
     }
   }

@@ -8,14 +8,14 @@ export async function triggerJob(req, res) {
     priority = 'normal',
     meta = {},
     retries,
-    delayMinutes,     // comes from request body
-    delayMs,         //  raw ms if you prefer
+    delayMinutes,    
+    delayMs,       
   } = req.body
 
   if (!subject) {
     return res.status(400).json({ ok: false, error: 'subject is required' })
   }
-  // Convert delayMinutes → ms if provided, else use raw delayMs, else 0 (immediate)
+  
   const resolvedDelayMs = delayMinutes
     ? delayMinutes * 60 * 1000
     : (delayMs ?? 0)

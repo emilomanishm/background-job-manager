@@ -22,7 +22,7 @@ const schema = new mongoose.Schema(
         completedAt: { type: Date },
         startedAt: { type: Date },
         failedAt: { type: Date },
-        logs: [log]
+        logs: [log],
     },
     { timestamps: true, collection: 'clt_background_jobs' }
 )
