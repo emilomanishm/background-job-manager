@@ -1,4 +1,3 @@
-import crypto from 'crypto'
 import { v4 as uuid } from 'uuid'
 
 /**
@@ -8,12 +7,14 @@ import { v4 as uuid } from 'uuid'
  * @param {Object}   params.model
  * @param {string}   [params.platform]
  * @param {Object}   [params.options]
- * @param {number}   [params.options.defaultRetries=3] 
+ * @param {number}   [params.options.defaultRetries=3]
  * @param {number}   [params.options.timeout=30000]
- * @param {string}   [params.options.secret]
- * @param {Function} [params.options.verifyHttp]       
+ * @param {Function} [params.options.verifyHttp]
  */
 export default class BackgroundJobManager {
+  #handlers = new Map()
+  #failureHandlers = new Map()
+
   constructor({ dispatcher, model, platform, options = {} }) {
     if (!dispatcher) throw new Error('BackgroundJobManager: dispatcher is required')
     if (!model) throw new Error('BackgroundJobManager: model is required')
@@ -24,23 +25,19 @@ export default class BackgroundJobManager {
     this.options = {
       defaultRetries: options.defaultRetries ?? 3,
       timeout: options.timeout ?? 30_000,
-      secret: options.secret ?? process.env.LAMBDA_WEBHOOK_SECRET ?? null,
       verifyHttp: options.verifyHttp ?? null,
     }
-    this.handlers = new Map()
-    this.failureHandlers = new Map()
   }
-
 
   /**
    * @param {string} subject
    * @param {Object} [payload={}]
    * @param {Object} [opts={}]
-   * @param {number}  [opts.delayMinutes]  
-   * @param {number}  [opts.delayMs]       
-   * @param {number}  [opts.retries]      
-   * @param {string}  [opts.priority]     
-   * @param {Object}  [opts.meta]          
+   * @param {number}  [opts.delayMinutes]
+   * @param {number}  [opts.delayMs]
+   * @param {number}  [opts.retries]
+   * @param {string}  [opts.priority]
+   * @param {Object}  [opts.meta]
    * @returns {Promise<{ jobId, status, delayMs, messageId, runAt? }>}
    */
   async trigger(subject, payload = {}, opts = {}) {
@@ -65,16 +62,11 @@ export default class BackgroundJobManager {
     })
 
     const result = await this.dispatcher.trigger({
-      jobId,
-      subject,
-      payload,
-      platform: this.platform,
-      delayMs,
+      jobId, subject, payload, platform: this.platform, delayMs,
     })
 
     return { jobId, status: 'queued', delayMs, ...result }
   }
-
 
   /**
    * @param {string}   subject
@@ -82,19 +74,18 @@ export default class BackgroundJobManager {
    *   ctx.jobId     — job ID
    *   ctx.subject   — subject string
    *   ctx.meta      — job meta object
-   *   ctx.attempts  — number of runs completed BEFORE this one (0 on first run)
+   *   ctx.attempts  — runs completed BEFORE this one (0 on first run)
    * @param {Object}   [opts]
-   * @param {number}   [opts.timeout]  
+   * @param {number}   [opts.timeout]
    * @returns {this}
    */
   handler(subject, callback, opts = {}) {
     if (typeof callback !== 'function') {
       throw new Error(`handler for "${subject}" must be a function`)
     }
-    this.handlers.set(subject, { callback, opts })
+    this.#handlers.set(subject, { callback, opts })
     return this
   }
-
 
   /**
    * @param {string|Function} subjectOrCallback
@@ -102,26 +93,27 @@ export default class BackgroundJobManager {
    *   async (payload, ctx) => void
    *   ctx.jobId       — job ID
    *   ctx.subject     — subject string
-   *   ctx.lastError   — the Error that caused the failure
+   *   ctx.lastError   — the Error thrown by the handler
    *   ctx.meta        — job meta object
-   *   ctx.attempts    — runs completed so far INCLUDING this failed one
+   *   ctx.attempts    — runs done INCLUDING this failed one
    *   ctx.maxAttempts — total runs allowed
-   *   ctx.reschedule  — async (delayMinutes?) => { jobId, messageId, runAt }
-   *                     re-dispatches the SAME job document via Scheduler
+   *   ctx.reschedule  — async (delayMinutes?) => re-dispatches SAME job document
    * @returns {this}
    */
-
   onFailure(subjectOrCallback, callback) {
     if (typeof subjectOrCallback === 'function') {
-      this.failureHandlers.set('*', subjectOrCallback)
+      this.#failureHandlers.set('*', subjectOrCallback)
     } else {
-      this.failureHandlers.set(subjectOrCallback, callback)
+      this.#failureHandlers.set(subjectOrCallback, callback)
     }
     return this
   }
 
-
-
+  /**
+   * Returns an Express handler for the Lambda webhook endpoint.
+   * Verifies HMAC, responds 200 immediately, processes async.
+   * @returns {Function}
+   */
   middleware() {
     return async (req, res) => {
       if (!this.options.verifyHttp) {
@@ -139,12 +131,12 @@ export default class BackgroundJobManager {
       }
 
       res.status(200).json({ ok: true, jobId })
-      setImmediate(() => this._process(jobId, subject, payload))
+      setImmediate(() => this.#process(jobId, subject, payload))
     }
   }
 
 
-  async _process(jobId, subject, payload) {
+  async #process(jobId, subject, payload) {
     const job = await this.model.findOne({ jobId })
     if (!job) return
     if (job.status === 'completed') return
@@ -153,9 +145,9 @@ export default class BackgroundJobManager {
       if (job.updatedAt > tenMinutesAgo) return
     }
 
-    const entry = this.handlers.get(subject)
+    const entry = this.#handlers.get(subject)
     if (!entry) {
-      await this._update(jobId, {
+      await this.#update(jobId, {
         status: 'failed',
         failedAt: new Date(),
         lastError: `No handler registered for subject: ${subject}`,
@@ -168,7 +160,7 @@ export default class BackgroundJobManager {
     const previousAttempts = job.attempts ?? 0
     const runNumber = previousAttempts + 1
 
-    await this._update(jobId, {
+    await this.#update(jobId, {
       status: 'processing',
       startedAt: new Date(),
       attempts: runNumber,
@@ -177,17 +169,12 @@ export default class BackgroundJobManager {
 
     const timeout = opts.timeout ?? this.options.timeout
     try {
-      await this._withTimeout(
-        callback(payload, {
-          jobId,
-          subject,
-          meta: job.meta,
-          attempts: previousAttempts,
-        }),
+      await this.#withTimeout(
+        callback(payload, { jobId, subject, meta: job.meta, attempts: previousAttempts }),
         timeout,
         jobId
       )
-      await this._update(jobId, {
+      await this.#update(jobId, {
         status: 'completed',
         completedAt: new Date(),
         lastError: null,
@@ -195,16 +182,15 @@ export default class BackgroundJobManager {
       })
 
     } catch (err) {
-      await this._update(jobId, {
+      await this.#update(jobId, {
         status: 'failed',
         failedAt: new Date(),
         lastError: err.message,
         $push: { logs: { attempt: runNumber, status: 'failed', log: `Run ${runNumber} failed: ${err.message}`, timestamp: new Date() } },
       })
 
-      await this._runFailure(subject, payload, {
-        jobId,
-        subject,
+      await this.#runFailure(subject, payload, {
+        jobId, subject,
         lastError: err,
         meta: job.meta,
         attempts: runNumber,
@@ -212,34 +198,23 @@ export default class BackgroundJobManager {
 
         reschedule: async (delayMinutes = 60) => {
           const delayMs = Math.round(delayMinutes * 60 * 1000)
-
-          await this._update(jobId, {
-            status: 'queued',
-            lastError: null,
-            failedAt: null,
-          })
-
+          await this.#update(jobId, { status: 'queued', lastError: null, failedAt: null })
           const result = await this.dispatcher.trigger({
-            jobId,
-            subject,
-            payload,
-            platform: this.platform,
-            delayMs,
+            jobId, subject, payload, platform: this.platform, delayMs,
           })
-
           return { jobId, ...result, delayMs }
         },
       })
     }
   }
 
-  async _runFailure(subject, payload, ctx) {
-    const fn = this.failureHandlers.get(subject) ?? this.failureHandlers.get('*')
+  async #runFailure(subject, payload, ctx) {
+    const fn = this.#failureHandlers.get(subject) ?? this.#failureHandlers.get('*')
     if (!fn) return
     try { await fn(payload, ctx) } catch (_) { }
   }
 
-  _update(jobId, fields) {
+  #update(jobId, fields) {
     const { $push, ...rest } = fields
     const update = {}
     if (Object.keys(rest).length > 0) update.$set = { ...rest, updatedAt: new Date() }
@@ -247,7 +222,7 @@ export default class BackgroundJobManager {
     return this.model.findOneAndUpdate({ jobId }, update, { new: true })
   }
 
-  _withTimeout(promise, ms, jobId) {
+  #withTimeout(promise, ms, jobId) {
     if (!ms) return promise
     return new Promise((resolve, reject) => {
       const t = setTimeout(
@@ -258,13 +233,5 @@ export default class BackgroundJobManager {
         .then((v) => { clearTimeout(t); resolve(v) })
         .catch((e) => { clearTimeout(t); reject(e) })
     })
-  }
-
-  _verify(rawBody, signature) {
-    if (!signature) return false
-    const expected = crypto.createHmac('sha256', this.options.secret).update(rawBody).digest('hex')
-    try {
-      return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(signature, 'hex'))
-    } catch { return false }
   }
 }
