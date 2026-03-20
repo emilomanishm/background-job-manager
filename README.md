@@ -1,586 +1,487 @@
-#  Background Job Manager
+# Background Job Worker
 
-A robust, event-driven Node.js microservice designed to orchestrate, schedule, and process asynchronous background jobs. 
+A dispatcher-based background job system built on Node.js, AWS EventBridge Scheduler, and MongoDB.
 
-Whether you need to send bulk notifications, process large files, or sync databases, this service offloads heavy tasks from your main application so it can remain fast and responsive.
+Trigger a job from anywhere in your app. It saves to MongoDB, schedules via AWS, runs when Scheduler fires, and rescheduled automatically on failure — all tracked in a single document per job.
 
----
-
-##  How It Works (The Lifecycle of a Job)
-
-1. **Creation:** A job is created and saved to the MongoDB database (`clt_background_jobs`) with a `queued` pending status.
-2. **Dispatching:** The system uses **AWS EventBridge Scheduler** to schedule the job for immediate or future execution.
-3. **Triggering:** At the scheduled time, AWS EventBridge sends a secure Webhook back to this application's API.
-4. **Processing:** The system routes the webhook to the correct **Handler** based on the job's "Subject" (e.g., `user:sync`).
-5. **Completion/Retry:** If successful, the job is marked `COMPLETED`. If it fails, it is automatically retried based on configured limits, or sent to a **Failure Handler**.
-
-```mermaid
-graph TD
-    A[1. Creation: Save to MongoDB] --> B[2. Dispatching: Schedule via AWS EventBridge]
-    B --> C[3. Triggering: AWS EventBridge fires Webhook to API]
-    C --> D[4. Processing: Route payload to Handler by Subject]
-    D --> E{5. Success?}
-    E -- Yes --> F[Mark job as COMPLETED]
-    E -- No --> G[Automatic Retry or route to Failure Handler]
+```
+Your app  →  trigger()  →  MongoDB (queued)  →  AWS Scheduler
+                                                      ↓
+                                              Lambda fires at scheduled time
+                                                      ↓
+                                         POST /api/lambda/jobs
+                                                      ↓
+                                    verifyHttp() → _process() → your handler()
+                                                      ↓
+                                           success → completed
+                                           failure → reschedule (same document)
+                                                      ↓
+                                           attempts >= maxAttempts → permanent failure
 ```
 
 ---
 
-##  Features
+## Quick start
 
-- **AWS EventBridge Integration**: Native scheduling and dispatching using `@aws-sdk/client-scheduler` and `@aws-sdk/client-eventbridge`.
-- **Secure Webhooks**: Verifies incoming AWS Lambda/EventBridge invocations using HTTP headers (`x-event-secret`).
-- **Modular Architecture**: Clean separation of concerns with dedicated handlers for processing jobs and handling failures.
-- **Database Tracking**: Jobs are tracked and persisted using MongoDB (`clt_background_jobs` collection).
-- **Automatic Retries**: Built-in retry mechanism with customizable attempt limits per job type.
+```bash
+git clone https://github.com/emilomanishm/background-job-manager
+cd background-job-worker
+cp  .env   
+npm install
+npm run dev
+```
 
 ---
 
-##  Project Structure
-
-```text
+## Project structure
 
 ```
 src/
 ├── lib/background-job-worker/
-│   ├── background-job-manager.js    ← core: orchestrates everything
-│   ├── event-bridge-dispatcher.js   ← immediate dispatch via EventBridge PutEvents
-│   ├── scheduler-dispatcher.js      ← delayed dispatch via EventBridge Scheduler
-│   ├── SqsDispatcher.js             ← optional: high-throughput via SQS
-│   ├── BullMQDispatcher.js          ← optional: no-AWS via Redis/BullMQ
-│   └── BullMQWorker.js              ← optional: worker for BullMQ dispatcher
+│   ├── background-job-manager.js    ← heart of the system — read this first
+│   ├── event-bridge-dispatcher.js   ← immediate jobs via EventBridge PutEvents
+│   ├── scheduler-dispatcher.js      ← delayed jobs via EventBridge Scheduler
+│   └── index.js                     ← re-exports all lib classes
 │
 ├── services/background-jobs/
-│   ├── index.js                   ← AWS config + manager singleton (only file that reads .env)
-│   ├── subjects.js                ← all job type strings in one place
-│   ├── handlers/                  ← your business logic, one file per domain
-│   │   ├── index.js               ← registers all handlers on the manager
+│   ├── index.js                     ← wires everything: dispatcher + manager + handlers
+│   ├── subjects.js                  ← all job type strings in one place
+│   ├── handlers/
+│   │   ├── index.js                 ← registers all handlers on the manager
 │   │   ├── notification.handler.js
 │   │   ├── user.handler.js
 │   │   ├── post.handler.js
 │   │   └── report.handler.js
-│   └── failure-handlers/          ← what to do when a job permanently fails
-│       ├── index.js               ← registers all failure handlers
+│   └── failure-handlers/
+│       ├── index.js                 ← registers all failure handlers
 │       ├── notification.failure.js
 │       └── user.failure.js
 │
 ├── controllers/
 │   └── background-jobs.controller.js
 ├── routes/
-│   ├── background-jobs.route.js   ← REST API: trigger, list, get, retry
-│   └── lambda.routes.js           ← /api/lambda/jobs — Lambda webhook
+│   ├── background-jobs.route.js     ← REST API: trigger, list, get, retry
+│   └── lambda.routes.js             ← /api/lambda/jobs — Lambda webhook entry point
 ├── models/
-│   └── clt_background_jobs.js     ← Mongoose schema, single document per job
+│   └── clt_background_jobs.js       ← Mongoose schema, one document per job
 ├── config/
 │   └── database.js
 ├── app.js
 └── server.js
 ```
 
-
 ---
 
+## Environment variables
 
-
-
-
-
-##  Installation & Setup
-
-### Prerequisites
-- MongoDB instance (local or MongoDB Atlas)
-- AWS Account 
-
-### 1. Clone the repository
-```bash
-git clone https://github.com/emilomanishm/background-job-manager.git
-cd background-job-manager
-```
-
-### 2. Install dependencies
-```bash
-npm install
-```
-
-### 3. Environment Variables
-Create a `.env` file in the root directory. 
-
+Copy `.env.example` to `.env`:
 
 ```env
-# Server & Database
+# Server
 PORT=3000
-MONGO_URI=mongodb://localhost:27017/your-database
+NODE_ENV=development
 
-# AWS Configuration (Used by EventBridge Dispatcher)
+# Database
+MONGO_URI=mongodb://localhost:27017/background_jobs
+
+# AWS — local dev only
+# On Lambda, remove these entirely. SDK auto-uses the execution role.
 AWS_REGION=ap-south-1
-AWS_ACCESS_KEY_ID=your_aws_access_key
-AWS_SECRET_ACCESS_KEY=your_aws_secret_key
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
 
-# AWS Lambda/Scheduler Targets
-AWS_LAMBDA_ARN=arn:aws:lambda:ap-south-1:123456789012:function:your-function
-AWS_SCHEDULER_ROLE_ARN=arn:aws:iam::123456789012:role/your-scheduler-role
+# EventBridge (immediate jobs)
+EVENTBRIDGE_BUS_NAME=default
+EVENTBRIDGE_SOURCE=app.background-jobs
 
-# Webhook Security (Must match the header sent by AWS)
-LAMBDA_WEBHOOK_SECRET=your_super_secret_webhook_token
+# EventBridge Scheduler (delayed jobs)
+AWS_LAMBDA_ARN=arn:aws:lambda:ap-south-1:ACCOUNT_ID:function:your-lambda
+AWS_SCHEDULER_ROLE_ARN=arn:aws:iam::ACCOUNT_ID:role/your-scheduler-role
+SCHEDULER_GROUP_NAME=default
+
+# Webhook security
+# Lambda signs the request body with this secret. Server verifies it.
+LAMBDA_WEBHOOK_SECRET=your_hmac_secret_here
+
+# Email (notification handlers)
+RESEND_API_KEY=re_your_key_here
+MAIL_FROM=onboarding@resend.dev
+
+# Ops alerts (optional — logs to console if not set)
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/xxx/yyy/zzz
 ```
 
-### 4. Run the Application
-
-**Development Mode (Auto-reloads on file changes):**
-```bash
-npm run dev
-```
-
-**Production Mode:**
-Runs the standard Node.js server.
-```bash
-npm start
-```
-
-## Job Subjects (Topics)
-
-The application routes incoming tasks based on predefined subjects. The following subjects are currently supported in `src/services/background-jobs/subjects.js`:
-
-- **User Operations**: 
-  - `user:sync`
-  - `user:update`
-  - `user:delete`
-- **Notifications**: 
-  - `notification:send`
-  - `notification:bulk`
-- **Post Processing**: 
-  - `post:process`
-  - `post:analyze`
-- **Reporting**: 
-  - `report:generate`
-  - `report:export`
+> **On Lambda:** Do not set `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. The Lambda execution role provides credentials automatically. Only set these locally.
 
 ---
 
-## API Routes
+## API endpoints
 
-The Express application exposes HTTP endpoints to receive webhooks and manage tasks. These are divided into two main files:
-
-### 1. Webhook Routes (`src/routes/lambda.routes.js`)
-These routes act as the bridge between AWS and your application. When AWS EventBridge Scheduler triggers a job, it makes a secure `POST` request to this route. The route intercepts the payload and passes it directly to the `BackgroundJobManager` for execution.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/lambda/jobs` | Lambda webhook (internal) |
-
-
-### 2. Management Routes (`src/routes/background-jobs.route.js`)
-These are internal API endpoints used by your main application to interact with the job system. Typically, these include endpoints to manually create/dispatch a new job, retrieve the execution status of a pending job, or manually retry a failed job.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/background-jobs/trigger` | Enqueue a new job |
-| GET  | `/api/v1/background-jobs` | List jobs (filter by status, subject) |
-| GET  | `/api/v1/background-jobs/:jobId` | Fetch single job |
-| POST | `/api/v1/background-jobs/:jobId/retry` | Re-enqueue a failed job |
-
----
-
-##  Webhook Security
-
-When AWS EventBridge/Lambda triggers a job execution, it hits the webhook endpoint defined in `lambda.routes.js`. 
-
-This request is verified by the `verifyHttp` function inside `src/services/background-jobs/index.js`, which ensures that the `x-event-secret` header passed in the request matches your local `LAMBDA_WEBHOOK_SECRET` environment variable.
-
-
-
-# background-job-manager — Deep Dive
-
-> **File:** `src/lib/background-job-worker/background-job-manager.js`
->
-> This is the heart of the entire system. Every other file either feeds into it or is called by it. Your application code only ever calls one method on it directly: `trigger()`.
-
----
-
-## The big picture
+### Trigger a job
 
 ```
-Your app                   background-job-manager              External
-──────────                 ────────────────────              ────────
-trigger() ────────────────► saves to MongoDB
-                           ► calls dispatcher.trigger() ──► AWS Scheduler
-
-                           (time passes — Scheduler fires)
-
-                           ◄── Lambda POSTs /api/lambda/jobs
-middleware() ◄─────────────── verifyHttp() checks HMAC
-                           ► responds 200 immediately
-                           ► setImmediate(_process())
-
-                           _process() runs:
-                             ► reads job from MongoDB
-                             ► runs your handler()
-                             ► success → status: completed
-                             ► failure → runs onFailure()
-                                        → ctx.reschedule()
-                                        → same doc re-dispatched
+POST /api/v1/background-jobs/trigger
+Content-Type: application/json
 ```
 
-**One rule:** Your code calls `trigger()`. AWS calls `middleware()`. Everything else is internal.
+**Request body:**
 
----
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `subject` | string | Yes | Job type — must match a registered handler |
+| `payload` | object | No | Data your handler receives |
+| `priority` | string | No | `low`, `normal`, `high` (default: `normal`) |
+| `retries` | number | No | Max reschedule cycles. `maxAttempts = retries + 1` (default: 3) |
+| `meta` | object | No | Extra info available as `ctx.meta` in your handler |
+| `delayMinutes` | number | No | Fire N minutes from now via Scheduler |
+| `delayMs` | number | No | Fire N milliseconds from now (ignored if `delayMinutes` is set) |
 
-## Constructor
+**Examples:**
 
-```js
-new BackgroundJobManager({
-  dispatcher,   // required — any dispatcher (Scheduler, SQS, BullMQ...)
-  model,        // required — Mongoose model
-  platform,     // optional — stored on each job, e.g. 'emilo'
-  options: {
-    defaultRetries: 3,       // maxAttempts = retries + 1
-    timeout:        30_000,  // per-handler timeout in ms
-    verifyHttp:     fn,      // (req) => boolean — signature verification
-  }
-})
-```
-
-The constructor stores `dispatcher` and `model` as instance properties and initialises two `Map` objects:
-- `this.handlers` — subject string → `{ callback, opts }`
-- `this.failureHandlers` — subject string → callback, or `'*'` → global fallback
-
----
-
-## Public methods
-
-### `trigger(subject, payload, opts)`
-
-**What it does:**
-1. Resolves delay — `delayMinutes` is converted to ms. `delayMinutes` takes priority over `delayMs`.
-2. Generates a UUID `jobId`.
-3. Creates the job document in MongoDB with `status: 'queued'`, `attempts: 0`.
-4. Calls `this.dispatcher.trigger({ jobId, subject, payload, delayMs })`.
-5. Returns `{ jobId, status, delayMs, messageId, runAt? }`.
-
-**Where `maxAttempts` comes from:**
-```
-maxAttempts = (opts.retries ?? this.options.defaultRetries) + 1
-```
-So `retries: 3` → `maxAttempts: 4` — meaning 4 total runs before permanent failure.
-
-**Options:**
-
-| Option | Type | Description |
-|---|---|---|
-| `delayMinutes` | number | Fire N minutes from now. Takes priority over `delayMs`. |
-| `delayMs` | number | Fire N milliseconds from now. |
-| `retries` | number | Max reschedule cycles. `maxAttempts = retries + 1`. |
-| `priority` | string | `low` / `normal` / `high`. Stored on document, display only. |
-| `meta` | object | Extra data. Available as `ctx.meta` inside your handler. |
-
-```js
-// Immediate
-await manager.trigger('notification:send', { email: 'user@example.com', template: 'welcome' })
-
-// Delayed 30 minutes, 5 reschedule cycles allowed
-await manager.trigger('report:generate', { reportType: 'monthly' }, {
-  delayMinutes: 30,
-  retries:      5,
-  meta:         { triggeredBy: 'cron' },
-})
-```
-
----
-
-### `handler(subject, callback, opts)`
-
-**What it does:** Stores your function in `this.handlers` keyed by subject. Called once at startup from `registerHandlers()`. Does nothing at call time — the callback is invoked later by `_process()`.
-
-**The callback signature:**
-
-```js
-async function myHandler(payload, ctx) {
-  // payload — the data you passed to trigger()
-  // ctx     — system data provided by the manager
-
-  ctx.jobId    // 'a3f8c1d2-...'
-  ctx.subject  // 'notification:send'
-  ctx.meta     // whatever you passed in opts.meta
-  ctx.attempts // runs completed BEFORE this one (0 on first run)
-
-  // Throw to fail the job → failure handler fires
-  // Return normally → job marked completed
+```json
+// Fire immediately
+{
+  "subject": "user:sync",
+  "payload": { "userId": "usr_123" }
 }
 ```
 
-**The `attempts` value in `ctx`:**
+```json
+// Fire in 30 minutes with 5 reschedule cycles
+{
+  "subject": "notification:send",
+  "payload": {
+    "email": "user@example.com",
+    "template": "welcome",
+    "data": { "name": "Raj" }
+  },
+  "delayMinutes": 30,
+  "retries": 5,
+  "meta": { "triggeredBy": "signup" }
+}
+```
 
-`ctx.attempts` is snapshotted from `job.attempts` **before** the update that increments it. So:
-- First run: `ctx.attempts === 0` (zero runs before this one)
-- Second run: `ctx.attempts === 1` (one run before this one)
+**Response:**
 
-This lets you change behaviour on retries:
+```json
+{
+  "ok": true,
+  "data": {
+    "jobId": "a3f8c1d2-7ccd-49e2-b9f4-2c58731c96be",
+    "status": "queued",
+    "delayMs": 0,
+    "messageId": "arn:aws:scheduler::..."
+  }
+}
+```
+
+### Other endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/background-jobs` | List jobs — `?status=failed&subject=user:sync&page=1&limit=20` |
+| `GET` | `/api/v1/background-jobs/:jobId` | Get a single job |
+| `POST` | `/api/v1/background-jobs/:jobId/retry` | Re-enqueue a failed job |
+| `POST` | `/api/lambda/jobs` | Lambda webhook — called by AWS, not by your app |
+| `GET` | `/health` | `{ ok: true, ts: "..." }` |
+
+---
+
+## Job types
+
+All subjects are defined in `services/background-jobs/subjects.js`. Always import from there.
+
 ```js
+// ✓ correct
+import { SUBJECTS } from '../subjects.js'
+await manager.trigger(SUBJECTS.NOTIFICATION_SEND, payload)
+
+// ✗ fragile — string typos fail silently
+await manager.trigger('notification:send', payload)
+```
+
+| Constant | Subject string | Description |
+|---|---|---|
+| `USER_SYNC` | `user:sync` | Sync user to external system |
+| `USER_UPDATE` | `user:update` | Update user record |
+| `USER_DELETE` | `user:delete` | Delete user |
+| `NOTIFICATION_SEND` | `notification:send` | Send single email via Resend |
+| `NOTIFICATION_BULK` | `notification:bulk` | Send batch emails in groups of 10 |
+| `POST_PROCESS` | `post:process` | Process post media/content |
+| `POST_ANALYZE` | `post:analyze` | Analyze post content |
+| `REPORT_GENERATE` | `report:generate` | Generate a report |
+| `REPORT_EXPORT` | `report:export` | Export to CSV/PDF |
+
+---
+
+## Writing a handler
+
+A handler is a plain async function. Throw to fail the job. Return normally to complete it.
+
+```js
+// services/background-jobs/handlers/notification.handler.js
+export async function notificationSendHandler(payload, ctx) {
+  const { email, template, data = {} } = payload
+
+  // Validate — throwing here triggers the failure handler
+  if (!email)    throw new Error('email is required')
+  if (!template) throw new Error('template is required')
+
+  console.log(`[notification:send] jobId=${ctx.jobId} run=${ctx.attempts + 1}`)
+
+  await sendEmail({ to: email, template, data })
+
+  // Returning normally marks the job completed
+}
+```
+
+### payload vs ctx
+
+**`payload`** is your data — whatever you pass as the second argument to `trigger()`.
+
+**`ctx`** is system data provided automatically on every run:
+
+| Field | Description |
+|---|---|
+| `ctx.jobId` | Unique job ID |
+| `ctx.subject` | e.g. `notification:send` |
+| `ctx.meta` | Whatever you passed in `opts.meta` |
+| `ctx.attempts` | Runs completed **before** this one. `0` on first run, `1` on second, etc. |
+
+```js
+// ctx.attempts lets you change behaviour on retries
 async function handler(payload, ctx) {
   if (ctx.attempts === 0) {
-    await fullAttempt(payload)    // first run — try everything
+    await fullAttempt(payload)     // first run — try everything
   } else {
-    await simpleFallback(payload) // retry — simpler approach
+    await simpleFallback(payload)  // retrying — simpler fallback
   }
 }
 ```
 
-**opts:**
-
-| Option | Type | Description |
-|---|---|---|
-| `timeout` | number | Per-handler timeout in ms. Overrides `options.timeout` from constructor. |
-
-The `retries` option previously used with RetryManager is now unused — retry cycles are controlled by `opts.retries` in `trigger()`.
-
----
-
-### `onFailure(subjectOrCallback, callback?)`
-
-**What it does:** Stores failure callbacks in `this.failureHandlers`. Two calling patterns:
+### Registering handlers
 
 ```js
-// Subject-specific
-manager.onFailure('notification:send', notificationFailureHandler)
-
-// Global fallback (fires when no subject-specific handler matches)
-manager.onFailure(async (payload, ctx) => { ... })
-```
-
-Global fallback is stored under the key `'*'`. When `_runFailure()` looks up the handler, it tries the subject key first, then falls back to `'*'`.
-
-**The failure handler signature:**
-
-```js
-async function myFailureHandler(payload, ctx) {
-  ctx.jobId       // failed job ID
-  ctx.subject     // 'notification:send'
-  ctx.lastError   // the Error object thrown by your handler
-  ctx.meta        // original opts.meta from trigger()
-  ctx.attempts    // runs done INCLUDING this failed one
-  ctx.maxAttempts // total allowed (retries + 1)
-  ctx.reschedule  // async (delayMinutes?) => { jobId, messageId, runAt }
+// services/background-jobs/handlers/index.js
+export function registerHandlers(manager) {
+  manager
+    .handler(SUBJECTS.NOTIFICATION_SEND, notificationSendHandler, { timeout: 10_000 })
+    .handler(SUBJECTS.USER_SYNC,         userSyncHandler)
+    .handler(SUBJECTS.REPORT_GENERATE,   reportGenerateHandler,   { timeout: 120_000 })
+    // ...
 }
 ```
 
-**The loop guard pattern:**
+The only option that still applies is `timeout` (in ms). The `retries` option is unused since RetryManager was removed — reschedule cycles are controlled by `opts.retries` in `trigger()`.
+
+---
+
+## Failure handling and rescheduling
+
+A failure handler fires when a job's handler throws. It decides whether to reschedule or give up permanently.
+
 ```js
-async function failureHandler(payload, ctx) {
+// services/background-jobs/failure-handlers/notification.failure.js
+export async function notificationFailureHandler(payload, ctx) {
+  console.error(
+    `[failure:notification] jobId=${ctx.jobId}` +
+    ` run=${ctx.attempts}/${ctx.maxAttempts}` +
+    ` error=${ctx.lastError?.message}`
+  )
+
+  // Stop when all runs are exhausted
   if (ctx.attempts >= ctx.maxAttempts) {
-    // All runs exhausted — alert ops, give up
+    console.error(`permanently failed — alerting ops`)
+    // await SlackService.alert(...)
     return
   }
-  await ctx.reschedule(30) // retry in 30 minutes
+
+  // Re-dispatch the same job in 30 minutes
+  const result = await ctx.reschedule(30)
+  console.log(`rescheduled → run ${ctx.attempts + 1} at ${result.runAt}`)
+}
+```
+
+### ctx fields in failure handlers
+
+| Field | Type | Description |
+|---|---|---|
+| `ctx.jobId` | string | The failed job ID |
+| `ctx.subject` | string | Job type |
+| `ctx.lastError` | Error | The error thrown by the handler |
+| `ctx.meta` | object | Original `opts.meta` from `trigger()` |
+| `ctx.attempts` | number | Runs completed including this failed one |
+| `ctx.maxAttempts` | number | Total runs allowed — stop when `attempts >= maxAttempts` |
+| `ctx.reschedule(minutes?)` | function | Re-dispatches the **same job document**. Default: 60 min. |
+
+### One document across all runs
+
+`ctx.reschedule()` does **not** create a new MongoDB document. It resets the existing document to `queued` and re-dispatches the same `jobId`. All run history accumulates in `logs[]`.
+
+```
+Job created — maxAttempts: 4
+
+Run 1: attempts 0→1 — fails — reschedule in 30 min
+Run 2: attempts 1→2 — fails — reschedule in 30 min
+Run 3: attempts 2→3 — fails — reschedule in 30 min
+Run 4: attempts 3→4 — fails — ctx.attempts(4) >= ctx.maxAttempts(4) → stop
+
+Final MongoDB document:
+  status:   'failed'
+  attempts: 4
+  logs:     8 entries (2 per run × 4 runs)
+```
+
+---
+
+## MongoDB schema
+
+Collection: `clt_background_jobs`
+
+| Field | Type | Notes |
+|---|---|---|
+| `jobId` | String | UUID, unique index |
+| `subject` | String | Job type, indexed |
+| `payload` | Mixed | Data from `trigger()` |
+| `status` | String | `queued` / `processing` / `completed` / `failed` |
+| `attempts` | Number | Runs done. Starts 0, increments each run. |
+| `maxAttempts` | Number | `retries + 1`. Controls reschedule limit. |
+| `lastError` | String | Message from last thrown Error |
+| `meta` | Mixed | `opts.meta` from `trigger()` |
+| `priority` | String | `low` / `normal` / `high` |
+| `logs` | Array | `{ attempt, status, log, timestamp }[]` — full run history |
+| `startedAt` | Date | When `_process()` last started |
+| `completedAt` | Date | Set on success |
+| `failedAt` | Date | Set on each failure |
+| `createdAt` | Date | When `trigger()` was called |
+| `updatedAt` | Date | Last update — used by idempotency guard |
+
+---
+
+## Webhook security
+
+Lambda signs the raw request body with HMAC-SHA256 using `LAMBDA_WEBHOOK_SECRET` and sends it as `x-job-signature`. The server verifies it in `services/background-jobs/index.js`.
+
+**Critical:** `app.js` captures the raw body before `express.json()` parses it:
+
+```js
+app.use(express.json())
+```
+
+If this order is changed or this middleware removed, every Lambda webhook returns 401. The HMAC is computed from raw bytes — re-serialising `req.body` via `JSON.stringify` can produce different byte sequences.
+
+---
+
+## Adding a new job type
+
+Four files. Nothing else changes.
+
+**1. Add to `subjects.js`**
+
+```js
+export const SUBJECTS = Object.freeze({
+  // ... existing subjects
+  EMAIL_SEND: 'email:send',
+})
+```
+
+**2. Write the handler**
+
+```js
+// services/background-jobs/handlers/email.handler.js
+export async function emailSendHandler(payload, ctx) {
+  if (!payload.to) throw new Error('to is required')
+  await EmailService.send(payload)
+}
+```
+
+**3. Register in `handlers/index.js`**
+
+```js
+import { emailSendHandler } from './email.handler.js'
+
+manager.handler(SUBJECTS.EMAIL_SEND, emailSendHandler, { timeout: 10_000 })
+```
+
+**4. Trigger it**
+
+```js
+await manager.trigger(SUBJECTS.EMAIL_SEND, {
+  to:      'user@example.com',
+  subject: 'Hello',
+  body:    'Your message.',
+})
+```
+
+---
+
+## AWS setup
+
+### IAM permissions
+
+The IAM user (local) or Lambda execution role (production) needs:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "events:PutEvents",
+    "scheduler:CreateSchedule",
+    "scheduler:DeleteSchedule"
+  ],
+  "Resource": "*"
+}
+```
+
+### EventBridge rule
+
+Create a rule on your bus targeting your Lambda function:
+
+```json
+{ "source": ["app.background-jobs"] }
+```
+
+### Lambda forwarder
+
+Your Lambda receives the event, signs the body, and POSTs to your server:
+
+```js
+// lambda/index.js
+import crypto from 'crypto'
+
+export async function handler(event) {
+  const body = JSON.stringify(event.detail ?? event)
+  const sig  = crypto
+    .createHmac('sha256', process.env.LAMBDA_WEBHOOK_SECRET)
+    .update(body)
+    .digest('hex')
+
+  const res = await fetch(`${process.env.SERVER_URL}/api/lambda/jobs`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', 'x-job-signature': sig },
+    body,
+  })
+
+  if (!res.ok) throw new Error(`Server responded ${res.status}`)
 }
 ```
 
 ---
 
-### `middleware()`
+## Quick reference: what to change and where
 
-**What it does:** Returns an Express request handler attached to `POST /api/lambda/jobs`. This is how AWS Scheduler gets a message back to your server after a job fires.
-
-**Sequence inside `middleware()`:**
-
-```
-1. Checks this.options.verifyHttp is configured → 401 if not
-2. Calls verifyHttp(req) → 401 if fails
-3. Reads { jobId, subject, payload } from req.body → 400 if missing
-4. res.status(200).json({ ok: true, jobId })   ← responds IMMEDIATELY
-5. setImmediate(() => this._process(...))        ← processes AFTER response
-```
-
-**Why `setImmediate`?** Lambda has a timeout. If the server waited for `_process()` to finish before responding, Lambda would time out on long jobs. Responding immediately lets Lambda close cleanly. The job processes in the background.
-
-**Signature verification:**
-
-`verifyHttp` is passed in from `services/background-jobs/index.js`. It reads `req.rawBody` (the raw bytes captured before `express.json()` runs) and computes HMAC-SHA256. Using raw bytes ensures the signature matches exactly what Lambda signed — re-serialising `req.body` via `JSON.stringify` can differ in key order.
-
----
-
-## Private methods
-
-### `_process(jobId, subject, payload)` — the core
-
-This runs on every Lambda invocation. It is the most important private method.
-
-**Step by step:**
-
-```
-1. Read job from MongoDB
-   → if not found: return
-   → if status === 'completed': return (idempotency)
-   → if status === 'processing' && updatedAt < 10 min ago: return (still running)
-
-2. Check handlers Map for subject
-   → if not found: status='failed', log entry, return
-
-3. Snapshot previousAttempts = job.attempts
-   runNumber = previousAttempts + 1
-
-4. Update MongoDB:
-   status='processing', startedAt=now, attempts=runNumber
-   logs.push({ attempt: runNumber, status: 'processing', ... })
-
-5. Call callback(payload, ctx) with timeout wrapper
-   → timeout default: 30,000ms (from options or handler opts)
-
-6a. Success:
-    status='completed', completedAt=now, lastError=null
-    logs.push({ ..., status: 'completed' })
-
-6b. Failure (throws):
-    status='failed', failedAt=now, lastError=err.message
-    logs.push({ ..., status: 'failed' })
-    → _runFailure(subject, payload, ctx)
-       ctx includes reschedule() fn
-```
-
-**The idempotency guard** is critical. Lambda can deliver the same event twice. Without the guard, a job could be processed twice — sending two emails, charging twice, etc. The 10-minute window allows re-processing of genuinely stuck jobs.
-
-**The `$push` / `$set` separation** in `_update()`:
-
-Mongoose requires `$push` and `$set` to be siblings at the top level of the update document. Spreading `$push` into the top-level object alongside plain fields causes it to be treated as a regular field and silently ignored — logs never write. `_update()` separates them:
-
-```js
-_update(jobId, fields) {
-  const { $push, ...rest } = fields
-  const update = {}
-  if (Object.keys(rest).length > 0) update.$set = { ...rest, updatedAt: new Date() }
-  if ($push) update.$push = $push
-  return this.model.findOneAndUpdate({ jobId }, update, { new: true })
-}
-```
-
----
-
-### `_runFailure(subject, payload, ctx)`
-
-Looks up the failure handler: subject-specific first, then `'*'`. Wraps the call in try/catch so a crashing failure handler cannot bubble up.
-
----
-
-### `_withTimeout(promise, ms, jobId)`
-
-Wraps a promise with a timeout. Resolves normally if the promise resolves before `ms`. Rejects with a timeout error otherwise. Clearing the timeout on both paths prevents memory leaks.
-
----
-
-## How `reschedule()` works inside `_process()`
-
-```js
-reschedule: async (delayMinutes = 60) => {
-  const delayMs = Math.round(delayMinutes * 60 * 1000)
-
-  // 1. Reset the existing document — same jobId, no new document
-  await this._update(jobId, {
-    status:    'queued',
-    lastError: null,
-    failedAt:  null,
-  })
-
-  // 2. Re-dispatch the same jobId
-  const result = await this.dispatcher.trigger({
-    jobId,      // ← SAME jobId
-    subject,
-    payload,
-    platform: this.platform,
-    delayMs,
-  })
-
-  return { jobId, ...result, delayMs }
-},
-```
-
-The dispatcher receives the same `jobId`. The Scheduler creates a new schedule pointing at the same job. When it fires, Lambda POSTs the same `jobId` to `middleware()`, which calls `_process()` again. `_process()` reads the document (now `status: 'queued'`, `attempts: 1`) and runs the handler again.
-
-**This is why one document tracks all runs.** `attempts` grows on each run. `logs[]` accumulates all history.
-
----
-
-## Document lifecycle — single document, four runs
-
-```
-trigger() called
-  ↓
-MongoDB: { status: 'queued', attempts: 0, maxAttempts: 4, logs: [] }
-
-Run 1 — Scheduler fires
-  ↓
-_process(): attempts → 1, status → 'processing'
-  ↓
-handler throws
-  ↓
-MongoDB: { status: 'failed', attempts: 1, logs: [run1-processing, run1-failed] }
-  ↓
-failure handler: ctx.attempts(1) < ctx.maxAttempts(4) → reschedule(30)
-  ↓
-MongoDB: { status: 'queued', attempts: 1 }  ← reset, attempts kept
-
-Run 2 — Scheduler fires 30 min later
-  ↓
-_process(): previousAttempts=1, runNumber=2, attempts → 2
-  ↓
-handler throws
-  ↓
-MongoDB: { status: 'failed', attempts: 2, logs: [run1×2, run2×2] }
-  ↓
-failure handler → reschedule(30)
-
-Run 3 → same pattern, attempts → 3
-
-Run 4 — Scheduler fires
-  ↓
-_process(): attempts → 4
-  ↓
-handler throws
-  ↓
-failure handler: ctx.attempts(4) >= ctx.maxAttempts(4) → return (no reschedule)
-  ↓
-MongoDB: { status: 'failed', attempts: 4, logs: [8 entries total] }
-                                                      ↑
-                                          2 per run × 4 runs
-```
-
----
-
-## How every other file connects to the manager
-
-```
-services/background-jobs/index.js
-  → new BackgroundJobManager({ dispatcher, model, options })
-  → registerHandlers(manager)       — calls manager.handler() 9 times
-  → registerFailureHandlers(manager) — calls manager.onFailure() 6 times
-  → export default manager          — single shared instance
-
-routes/lambda.routes.js
-  → router.post('/jobs', manager.middleware())
-  → Express routes Lambda webhook to the manager
-
-routes/background-jobs.route.js
-  → calls controller functions
-
-controllers/background-jobs.controller.js
-  → import manager
-  → manager.trigger(subject, payload, opts)   ← the only public call your app makes
-  → BackgroundJob.findOne / .find             ← reads DB directly for GET endpoints
-```
-
-The manager is a **singleton**. It is created once at startup in `index.js`, all handlers registered, then exported. Every request to `POST /api/v1/background-jobs/trigger` and every Lambda webhook hits the same instance.
-
----
-
-## What to change and where
-
-| You want to... | Change this |
+| You want to... | Change this file |
 |---|---|
-| Add a new job type | `subjects.js` + new handler file + register in `handlers/index.js` |
-| Change what happens on failure | `failure-handlers/notification.failure.js` or `user.failure.js` |
-| Change how many reschedules | Pass `retries` to `trigger()`, or change `defaultRetries` in constructor |
-| Change retry delay | Pass different `delayMinutes` to `ctx.reschedule()` in failure handler |
-| Change handler timeout | Pass `{ timeout: ms }` as third arg to `manager.handler()` |
-| Swap transport (SQS, BullMQ) | Change dispatcher in `services/background-jobs/index.js` |
-| Change signature verification | Change `verifyHttp` function in `services/background-jobs/index.js` |
-| Add a new field to jobs | Add to `clt_background_jobs.js` schema |
+| Add a new job type | `subjects.js` + new handler + register in `handlers/index.js` |
+| Change failure behaviour | `failure-handlers/notification.failure.js` or `user.failure.js` |
+| Change reschedule count | `opts.retries` in `trigger()`, or `defaultRetries` in `services/index.js` |
+| Change reschedule delay | `ctx.reschedule(minutes)` argument in your failure handler |
+| Change handler timeout | `{ timeout: ms }` in `manager.handler()` call |
+| Swap AWS transport | Replace dispatcher in `services/background-jobs/index.js` |
+| Change signature verification | `verifyHttp` function in `services/background-jobs/index.js` |
+| Add a DB field | `models/clt_background_jobs.js` |
 
-**You should never need to edit `background-job-manager.js` itself** unless you are changing core orchestration behaviour.
+> For a complete explanation of how `background-job-manager.js` works internally,
+
+---
+
