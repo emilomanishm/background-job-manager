@@ -2,34 +2,19 @@ import manager from '../services/background-jobs/index.js'
 import BackgroundJob from '../models/clt_background_jobs.js'
 
 export async function triggerJob(req, res) {
-  const {
-    subject,
-    payload = {},
-    priority = 'normal',
-    meta = {},
-    retries,
-    delayMinutes,    
-    delayMs,       
-  } = req.body
-
+ const { subject, payload = {}, priority = 'normal', meta = {}, retries, delayMinutes } = req.body
   if (!subject) {
     return res.status(400).json({ ok: false, error: 'subject is required' })
   }
   
-  const resolvedDelayMs = delayMinutes
-    ? delayMinutes * 60 * 1000
-    : (delayMs ?? 0)
-
   const result = await manager.trigger(subject, payload, {
     priority,
     meta,
     retries,
-    delayMs: resolvedDelayMs,
+    delayMinutes
   })
-
   return res.status(202).json({ ok: true, data: result })
 }
-
 
 export async function getJob(req, res) {
   const job = await BackgroundJob.findOne({ jobId: req.params.jobId }).lean()

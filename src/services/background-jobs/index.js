@@ -4,7 +4,7 @@ import SchedulerDispatcher from '../../lib/background-job-worker/scheduler-dispa
 
 import BackgroundJob from '../../models/clt_background_jobs.js'
 import { registerHandlers } from './handlers/index.js'
-import { registerFailureHandlers } from './failure-handlers/index.js'
+//import { registerFailureHandlers } from './failure-handlers/index.js'
 
 /**
  * Initialized BackgroundJobManager with dispatcher, model, and handlers
@@ -33,6 +33,6 @@ const manager = new BackgroundJobManager({
 })
 
 registerHandlers(manager)
-registerFailureHandlers(manager)
+//registerFailureHandlers(manager)
 
 export default manager

@@ -1,18 +1,27 @@
 import { v4 as uuid } from 'uuid'
 
+/** @import { TriggerOptions, TriggerResult, BackgroundJobModel, BackgroundJobManagerOptions, BackgroundJobHandlerContext, BackgroundJobHandlerOpts, BackgroundJobFailureCallbackContext, DispatchPayload, BackgroundJobHttpVerifierFn } from './types.d.ts' */
+
+const INCREMENTAL_DELAYS = [1, 2, 3, 4, 5]
+
+function getDelay(attempts) {
+  const index = Math.min(attempts - 1, INCREMENTAL_DELAYS.length - 1)
+  return INCREMENTAL_DELAYS[index]
+}
+
 /**
- * @constructor
- * @param {Object}   params
- * @param {Object}   params.dispatcher
- * @param {Object}   params.model
- * @param {string}   [params.platform]
- * @param {Object}   [params.options]
- * @param {number}   [params.options.defaultRetries=3]
- * @param {number}   [params.options.timeout=30000]
- * @param {Function} [params.options.verifyHttp]
+ * @param {Object}                             params
+ * @param {import('./types.d.ts').BackgroundJobDispatcher} params.dispatcher
+ * @param {BackgroundJobModel}                 params.model
+ * @param {string}                             [params.platform]
+ * @param {BackgroundJobManagerOptions}        [params.options]
  */
 export default class BackgroundJobManager {
+
+  /** @type {Map<string, { callback: (payload: unknown, ctx: BackgroundJobHandlerContext) => void | Promise<void>, opts: BackgroundJobHandlerOpts }>} */
   #handlers = new Map()
+
+  /** @type {Map<string, (payload: unknown, ctx: BackgroundJobFailureCallbackContext) => void | Promise<void>>} */
   #failureHandlers = new Map()
 
   constructor({ dispatcher, model, platform, options = {} }) {
@@ -22,6 +31,8 @@ export default class BackgroundJobManager {
     this.dispatcher = dispatcher
     this.model = model
     this.platform = platform ?? 'local'
+
+    /** @type {Required<BackgroundJobManagerOptions> & { verifyHttp: BackgroundJobHttpVerifierFn | null }} */
     this.options = {
       defaultRetries: options.defaultRetries ?? 3,
       timeout: options.timeout ?? 30_000,
@@ -30,15 +41,12 @@ export default class BackgroundJobManager {
   }
 
   /**
-   * @param {string} subject
-   * @param {Object} [payload={}]
-   * @param {Object} [opts={}]
-   * @param {number}  [opts.delayMinutes]
-   * @param {number}  [opts.delayMs]
-   * @param {number}  [opts.retries]
-   * @param {string}  [opts.priority]
-   * @param {Object}  [opts.meta]
-   * @returns {Promise<{ jobId, status, delayMs, messageId, runAt? }>}
+   * Create a job document in MongoDB and dispatch it.
+   *
+   * @param {string}         subject
+   * @param {unknown}        [payload={}]
+   * @param {TriggerOptions} [opts={}]
+   * @returns {Promise<TriggerResult>}
    */
   async trigger(subject, payload = {}, opts = {}) {
     if (!subject) throw new Error('subject is required')
@@ -61,22 +69,21 @@ export default class BackgroundJobManager {
       lastError: null,
     })
 
-    const result = await this.dispatcher.trigger({
-      jobId, subject, payload, platform: this.platform, delayMs,
-    })
+    /** @type {DispatchPayload} */
+    const dispatchPayload = { jobId, subject, payload, platform: this.platform, delayMs }
+    const result = await this.dispatcher.trigger(dispatchPayload)
 
     return { jobId, status: 'queued', delayMs, ...result }
   }
 
   /**
-   * @param {string}   subject
-   * @param {Function} callback  
+   * @param {string} subject
+   * @param {(payload: unknown, ctx: BackgroundJobHandlerContext) => void | Promise<void>} callback
    *   ctx.jobId     — job ID
    *   ctx.subject   — subject string
    *   ctx.meta      — job meta object
    *   ctx.attempts  — runs completed BEFORE this one (0 on first run)
-   * @param {Object}   [opts]
-   * @param {number}   [opts.timeout]
+   * @param {BackgroundJobHandlerOpts} [opts={}]
    * @returns {this}
    */
   handler(subject, callback, opts = {}) {
@@ -88,15 +95,14 @@ export default class BackgroundJobManager {
   }
 
   /**
-   * @param {string|Function} subjectOrCallback
-   * @param {Function}        [callback]
-   *   async (payload, ctx) => void
+   * @param {string | ((payload: unknown, ctx: BackgroundJobFailureCallbackContext) => void | Promise<void>)} subjectOrCallback
+   * @param {(payload: unknown, ctx: BackgroundJobFailureCallbackContext) => void | Promise<void>} [callback]
    *   ctx.jobId       — job ID
    *   ctx.subject     — subject string
    *   ctx.lastError   — the Error thrown by the handler
    *   ctx.meta        — job meta object
    *   ctx.attempts    — runs done INCLUDING this failed one
-   *   ctx.maxAttempts — total runs allowed
+   *   ctx.maxAttempts — total runs allowed (retries + 1)
    *   ctx.reschedule  — async (delayMinutes?) => re-dispatches SAME job document
    * @returns {this}
    */
@@ -110,9 +116,7 @@ export default class BackgroundJobManager {
   }
 
   /**
-   * Returns an Express handler for the Lambda webhook endpoint.
-   * Verifies HMAC, responds 200 immediately, processes async.
-   * @returns {Function}
+   * @returns {(req: import('express').Request, res: import('express').Response) => Promise<void>}
    */
   middleware() {
     return async (req, res) => {
@@ -135,7 +139,13 @@ export default class BackgroundJobManager {
     }
   }
 
-
+  /**
+   * Core processing loop — runs on every Lambda invocation.
+   *
+   * @param {string}  jobId
+   * @param {string}  subject
+   * @param {unknown} payload
+   */
   async #process(jobId, subject, payload) {
     const job = await this.model.findOne({ jobId })
     if (!job) return
@@ -189,8 +199,10 @@ export default class BackgroundJobManager {
         $push: { logs: { attempt: runNumber, status: 'failed', log: `Run ${runNumber} failed: ${err.message}`, timestamp: new Date() } },
       })
 
-      await this.#runFailure(subject, payload, {
-        jobId, subject,
+      /** @type {BackgroundJobFailureCallbackContext} */
+      const ctx = {
+        jobId,
+        subject,
         lastError: err,
         meta: job.meta,
         attempts: runNumber,
@@ -204,16 +216,39 @@ export default class BackgroundJobManager {
           })
           return { jobId, ...result, delayMs }
         },
-      })
+      }
+
+      await this.#runFailure(subject, payload, ctx)
     }
   }
 
+  /**
+   * Look up and call the failure handler for this subject.
+   * Falls back to global '*' handler, then to built-in incremental reschedule.
+   *
+   * @param {string}                            subject
+   * @param {unknown}                           payload
+   * @param {BackgroundJobFailureCallbackContext} ctx
+   */
   async #runFailure(subject, payload, ctx) {
     const fn = this.#failureHandlers.get(subject) ?? this.#failureHandlers.get('*')
-    if (!fn) return
-    try { await fn(payload, ctx) } catch (_) { }
+
+    if (fn) {
+      try { await fn(payload, ctx) } catch (_) { }
+      return
+    }
+    // No handler registered — built-in incremental reschedule
+    if (ctx.attempts >= ctx.maxAttempts) return
+    try { await ctx.reschedule(getDelay(ctx.attempts)) } catch (_) { }
   }
 
+  /**
+   * Write fields to the job document.
+   * Separates $push from $set — Mongoose requires them as sibling operators.
+   *
+   * @param {string} jobId
+   * @param {Record<string, unknown> & { $push?: Record<string, unknown> }} fields
+   */
   #update(jobId, fields) {
     const { $push, ...rest } = fields
     const update = {}
@@ -222,6 +257,14 @@ export default class BackgroundJobManager {
     return this.model.findOneAndUpdate({ jobId }, update, { new: true })
   }
 
+  /**
+   * Wrap a promise with a timeout.
+   *
+   * @param {Promise<unknown>} promise
+   * @param {number}           ms
+   * @param {string}           jobId
+   * @returns {Promise<unknown>}
+   */
   #withTimeout(promise, ms, jobId) {
     if (!ms) return promise
     return new Promise((resolve, reject) => {
